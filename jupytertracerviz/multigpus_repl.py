@@ -50,19 +50,19 @@ def wrap_last_expr_with_print(code):
         return code
         
 def _output_monitor(rank, output_queue, callback):
+    """
+    Monitor for initialization messages only.
+    Regular execution outputs are handled synchronously in execute_on_gpus.
+    """
     global _STOP_OUTPUT_THREADS
     
     while not _STOP_OUTPUT_THREADS:
         try:
             try:
                 output = output_queue.get(block=True, timeout=0.1)
-                if callback:
-                    if isinstance(output, tuple):
-                        status = output[1]
-                        output = output[0]
-                    else:
-                        status = "success"
-                    callback(rank, output, status)
+                if callback and isinstance(output, dict) and output.get('type') == 'init':
+                    # Only handle initialization messages
+                    callback(rank, output.get('message', ''), output.get('status', 'success'))
             except Exception as e:
                 pass
         except:
@@ -78,7 +78,13 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     
-    result_queue.put({"status": "init", "message": f"Worker {rank}/{world_size} initialized on GPU {rank} on {master_addr}:{master_port}"})
+    # Send initialization message through output queue
+    output_queue.put({
+        'type': 'init',
+        'message': f"Worker {rank}/{world_size} initialized on GPU {rank} on {master_addr}:{master_port}",
+        'status': 'success'
+    })
+    result_queue.put({"status": "init", "message": f"Worker {rank}/{world_size} initialized"})
     
     local_namespace = {"rank": rank, "world_size": world_size}
     exec("import torch", local_namespace)
@@ -87,11 +93,14 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
     exec("import torch.multiprocessing as mp", local_namespace)
     exec("from torch.nn.parallel import DistributedDataParallel as DDP", local_namespace)
 
+    # Buffer for collecting print outputs during command execution
+    print_buffer = []
+    
     def custom_print(*args, **kwargs):
         sep = kwargs.get("sep", " ")
         end = kwargs.get("end", "\n")
         message = sep.join(str(arg) for arg in args) + end
-        output_queue.put(message)
+        print_buffer.append(message)
 
     local_namespace["print"] = custom_print
     
@@ -102,6 +111,9 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
             if cmd == "EXIT":
                 break
 
+            # Clear print buffer for new command
+            print_buffer.clear()
+            
             output_buffer = StringIO()
             original_stdout = sys.stdout
             sys.stdout = output_buffer
@@ -111,13 +123,12 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
             try:
                 exec(cmd, local_namespace)
                 stdout_content = output_buffer.getvalue()
+                all_output = ''.join(print_buffer) + stdout_content
                 status = "success"
-                if stdout_content:
-                    output_queue.put((stdout_content, status))
 
                 result = {
                     "status": status,
-                    "output": stdout_content, 
+                    "output": all_output, 
                     "cmd_id": cmd_id,
                     "rank": rank
                 }
@@ -125,14 +136,14 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
                 stdout_content = output_buffer.getvalue()
+                all_output = ''.join(print_buffer) + stdout_content
                 status = "error"
-                output_queue.put((tb_str, status))
 
                 result = {
                     "status": status,
                     "error": str(e),
                     "traceback": tb_str,
-                    "output": stdout_content,
+                    "output": all_output,
                     "cmd_id": cmd_id,
                     "rank": rank
                 }
@@ -144,20 +155,20 @@ def _worker_process(rank, world_size, command_queue, output_queue, result_queue,
         except Exception as e:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-            output_queue.put((tb_str, status))
 
             result_queue.put({
                 "status": "error", 
                 "error": f"Worker error: {str(e)}",
                 "traceback": tb_str,
-                "cmd_id": cmd_id,
+                "cmd_id": cmd_id if 'cmd_id' in locals() else None,
                 "rank": rank
             })
     
     dist.destroy_process_group()
     result_queue.put({"status": "exit", "message": f"Worker {rank} exiting"})
 
-def _print_output(rank, message, status = "success"):
+def _print_output(rank, message, status="success"):
+    """Only used for initialization messages"""
     if PRINT_ON_RANK > -1 and rank != PRINT_ON_RANK:
         return
 
@@ -270,6 +281,21 @@ def execute_on_gpus(code):
         results.append(result)
     
     results.sort(key=lambda r: r.get("rank", 0))
+    
+    # Print outputs synchronously in the current cell context
+    for result in results:
+        rank = result.get('rank', 0)
+        output = result.get('output', '')
+        status = result.get('status', 'success')
+        
+        if output and (PRINT_ON_RANK == -1 or rank == PRINT_ON_RANK):
+            print(f"[GPU {rank}] {output}", end='')
+        
+        # Print errors/tracebacks
+        if status == 'error':
+            traceback_str = result.get('traceback', result.get('error', ''))
+            if traceback_str:
+                print(f"[GPU {rank}] ERROR:\n{traceback_str}", file=sys.stderr)
 
 @register_cell_magic
 def multigpus(line, cell):
@@ -277,4 +303,4 @@ def multigpus(line, cell):
         num_gpus = int(line.strip()) if line.strip() else None
         init_multigpus_repl(num_gpus)
     
-    return execute_on_gpus(cell)
+    execute_on_gpus(cell)
